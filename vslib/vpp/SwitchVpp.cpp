@@ -1945,6 +1945,7 @@ sai_status_t SwitchVpp::remove(
     if (object_type == SAI_OBJECT_TYPE_TUNNEL_MAP_ENTRY)
     {
         m_tunnel_mgr.handle_l2_vxlan_tunnel_map_entry_removal(serializedObjectId);
+        m_tunnel_mgr.handle_l3_vni_map_entry_removal(serializedObjectId);
         return remove_internal(object_type, serializedObjectId);
     }
 

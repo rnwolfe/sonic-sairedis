@@ -160,14 +160,7 @@ TunnelManager::tunnel_encap_nexthop_action(
     dst_ip = attr.value.ipaddr;
 
     auto fill_vxlan_req = [&](vpp_vxlan_tunnel_t &req, u_int32_t vni) {
-        memset(&req, 0, sizeof(req));
-        req.dst_port = m_vxlan_port;
-        req.src_port = m_vxlan_port;
-        req.instance = ~0;
-        sai_ip_address_t_to_vpp_ip_addr_t(src_ip, req.src_address);
-        sai_ip_address_t_to_vpp_ip_addr_t(dst_ip, req.dst_address);
-        req.decap_next_index = ~0;
-        req.vni = vni;
+        fill_l3_vxlan_req(req, src_ip, dst_ip, vni);
     };
 
     if (action == Action::DELETE) {
@@ -179,13 +172,24 @@ TunnelManager::tunnel_encap_nexthop_action(
             return SAI_STATUS_SUCCESS;
         }
 
-        vpp_vxlan_tunnel_t req;
-        fill_vxlan_req(req, encap_map_it->second.vni);
-
-        remove_vpp_vxlan_decap(encap_map_it->second);
-        remove_vpp_vxlan_encap(req, encap_map_it->second);
+        TunnelVPPData tunnel_data = encap_map_it->second;
 
         m_tunnel_encap_nexthop_map.erase(encap_map_it);
+
+        vpp_vxlan_tunnel_t req;
+        fill_vxlan_req(req, tunnel_data.vni);
+
+        // While other next hops use the VTEP it can keep sending this VNI:
+        // the tunnel stays, decap only.
+        if (has_l3_nexthop_to(dst_ip)) {
+            set_l3_tunnel_neighbor(req, tunnel_data, false);
+            m_l3_decap_tunnels[l3_tunnel_key(dst_ip, tunnel_data.vni)] = tunnel_data;
+            return SAI_STATUS_SUCCESS;
+        }
+
+        remove_vpp_vxlan_decap(tunnel_data);
+        remove_vpp_vxlan_encap(req, tunnel_data);
+        remove_l3_decap_tunnels(&dst_ip, 0);
         return SAI_STATUS_SUCCESS;
     }
 
@@ -270,23 +274,36 @@ TunnelManager::tunnel_encap_nexthop_action(
             tunnel_data.vni = tunnel_vni;
             tunnel_data.has_remote_router_mac = nh_has_mac;
             tunnel_data.remote_router_mac = nh_mac;
+            tunnel_data.src_ip = src_ip;
+            tunnel_data.dst_ip = dst_ip;
             fill_vxlan_req(req, tunnel_vni);
 
-            if (create_vpp_vxlan_encap(req, tunnel_data) != SAI_STATUS_SUCCESS) {
-                SWSS_LOG_ERROR("Failed to create vxlan encap for %s",
-                    tunnel_nh_obj->get_id().c_str());
-                return SAI_STATUS_FAILURE;
-            }
+            auto decap_it = m_l3_decap_tunnels.find(l3_tunnel_key(dst_ip, tunnel_vni));
+            if (decap_it != m_l3_decap_tunnels.end()) {
+                // The VTEP's decap-only tunnel of this VNI becomes the next hop's
+                tunnel_data.sw_if_index = decap_it->second.sw_if_index;
+                tunnel_data.bd_id = decap_it->second.bd_id;
+                tunnel_data.decap_host_if = decap_it->second.decap_host_if;
+                m_l3_decap_tunnels.erase(decap_it);
+                set_l3_tunnel_neighbor(req, tunnel_data, true);
+            } else {
+                if (create_vpp_vxlan_encap(req, tunnel_data) != SAI_STATUS_SUCCESS) {
+                    SWSS_LOG_ERROR("Failed to create vxlan encap for %s",
+                        tunnel_nh_obj->get_id().c_str());
+                    return SAI_STATUS_FAILURE;
+                }
 
-            if (create_vpp_vxlan_decap(tunnel_data) != SAI_STATUS_SUCCESS) {
-                SWSS_LOG_ERROR("Failed to create vxlan decap for %s",
-                    tunnel_nh_obj->get_id().c_str());
-                remove_vpp_vxlan_encap(req, tunnel_data);
-                return SAI_STATUS_FAILURE;
+                if (create_vpp_vxlan_decap(tunnel_data) != SAI_STATUS_SUCCESS) {
+                    SWSS_LOG_ERROR("Failed to create vxlan decap for %s",
+                        tunnel_nh_obj->get_id().c_str());
+                    remove_vpp_vxlan_encap(req, tunnel_data);
+                    return SAI_STATUS_FAILURE;
+                }
             }
             m_tunnel_encap_nexthop_map[object_id] = tunnel_data;
 
             if (nh_has_vni) {
+                create_l3_decap_tunnels(tunnel_obj.get(), tunnel_data);
                 return SAI_STATUS_SUCCESS;
             }
         }
@@ -327,6 +344,215 @@ TunnelManager::remove_tunnel_encap_nexthop(
     return tunnel_encap_nexthop_action(tunnel_nh_obj.get(), Action::DELETE);
 }
 
+std::pair<std::string, u_int32_t>
+TunnelManager::l3_tunnel_key(
+                    _In_ const sai_ip_address_t& dst_ip,
+                    _In_ u_int32_t vni)
+{
+    SWSS_LOG_ENTER();
+
+    return std::make_pair(sai_serialize_ip_address(dst_ip), vni);
+}
+
+void
+TunnelManager::fill_l3_vxlan_req(
+                    _Out_ vpp_vxlan_tunnel_t& req,
+                    _In_ const sai_ip_address_t& src_ip,
+                    _In_ const sai_ip_address_t& dst_ip,
+                    _In_ u_int32_t vni)
+{
+    SWSS_LOG_ENTER();
+
+    memset(&req, 0, sizeof(req));
+    req.dst_port = m_vxlan_port;
+    req.src_port = m_vxlan_port;
+    req.instance = ~0;
+    sai_ip_address_t src = src_ip;
+    sai_ip_address_t dst = dst_ip;
+
+    sai_ip_address_t_to_vpp_ip_addr_t(src, req.src_address);
+    sai_ip_address_t_to_vpp_ip_addr_t(dst, req.dst_address);
+    req.decap_next_index = ~0;
+    req.vni = vni;
+}
+
+void
+TunnelManager::set_l3_tunnel_neighbor(
+                    _In_ const vpp_vxlan_tunnel_t& req,
+                    _In_ const TunnelVPPData& tunnel_data,
+                    _In_ bool is_add)
+{
+    SWSS_LOG_ENTER();
+
+    auto router_mac = tunnel_data.has_remote_router_mac ?
+                          tunnel_data.remote_router_mac : get_router_mac();
+    auto bvi_mac = router_mac.data();
+    auto dst = req.dst_address;
+
+    /* the neighbour is to build inner ether. use no_fib_entry to avoid creating the nh in the fib, which will mess up underlay forwarding*/
+    if (dst.sa_family == AF_INET6) {
+        ip6_nbr_add_del(NULL, tunnel_data.sw_if_index, &dst.addr.ip6, false, true/*no_fib_entry*/, bvi_mac, is_add ? 1 : 0);
+    } else {
+        ip4_nbr_add_del(NULL, tunnel_data.sw_if_index, &dst.addr.ip4, false, true/*no_fib_entry*/, bvi_mac, is_add ? 1 : 0);
+    }
+}
+
+bool
+TunnelManager::has_l3_nexthop_to(
+                    _In_ const sai_ip_address_t& dst_ip) const
+{
+    SWSS_LOG_ENTER();
+
+    for (const auto& it : m_tunnel_encap_nexthop_map) {
+        if (sai_ip_address_equal(it.second.dst_ip, dst_ip)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool
+TunnelManager::has_l3_tunnel(
+                    _In_ const sai_ip_address_t& dst_ip,
+                    _In_ u_int32_t vni) const
+{
+    SWSS_LOG_ENTER();
+
+    if (m_l3_decap_tunnels.count(l3_tunnel_key(dst_ip, vni))) {
+        return true;
+    }
+    for (const auto& it : m_tunnel_encap_nexthop_map) {
+        if (it.second.vni == vni && sai_ip_address_equal(it.second.dst_ip, dst_ip)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void
+TunnelManager::create_l3_decap_tunnels(
+                    _In_ const SaiObject* tunnel_obj,
+                    _In_ const TunnelVPPData& nh_tunnel_data)
+{
+    SWSS_LOG_ENTER();
+
+    sai_attribute_t attr;
+    auto tunnel_encap_mappers = tunnel_obj->get_linked_objects(SAI_OBJECT_TYPE_TUNNEL_MAP, SAI_TUNNEL_ATTR_ENCAP_MAPPERS);
+
+    for (auto tunnel_encap_mapper : tunnel_encap_mappers) {
+        attr.id = SAI_TUNNEL_MAP_ATTR_TYPE;
+        if (tunnel_encap_mapper->get_attr(attr) != SAI_STATUS_SUCCESS ||
+            attr.value.s32 != SAI_TUNNEL_MAP_TYPE_VIRTUAL_ROUTER_ID_TO_VNI) {
+            continue;
+        }
+
+        auto entries = tunnel_encap_mapper->get_child_objs(SAI_OBJECT_TYPE_TUNNEL_MAP_ENTRY);
+        if (entries == nullptr) {
+            continue;
+        }
+        for (auto pair : *entries) {
+            auto entry = pair.second;
+
+            attr.id = SAI_TUNNEL_MAP_ENTRY_ATTR_VNI_ID_VALUE;
+            if (entry->get_attr(attr) != SAI_STATUS_SUCCESS) {
+                continue;
+            }
+            u_int32_t vni = attr.value.u32;
+
+            if (has_l3_tunnel(nh_tunnel_data.dst_ip, vni)) {
+                continue;
+            }
+
+            attr.id = SAI_TUNNEL_MAP_ENTRY_ATTR_VIRTUAL_ROUTER_ID_KEY;
+            if (entry->get_attr(attr) != SAI_STATUS_SUCCESS) {
+                continue;
+            }
+            auto ip_vrf = m_switch_db->vpp_get_ip_vrf(attr.value.oid);
+            if (!ip_vrf) {
+                continue;
+            }
+
+            TunnelVPPData tunnel_data;
+            vpp_vxlan_tunnel_t req;
+
+            tunnel_data.ip_vrf = ip_vrf;
+            tunnel_data.vni = vni;
+            tunnel_data.has_remote_router_mac = nh_tunnel_data.has_remote_router_mac;
+            tunnel_data.remote_router_mac = nh_tunnel_data.remote_router_mac;
+            tunnel_data.src_ip = nh_tunnel_data.src_ip;
+            tunnel_data.dst_ip = nh_tunnel_data.dst_ip;
+            fill_l3_vxlan_req(req, tunnel_data.src_ip, tunnel_data.dst_ip, vni);
+
+            if (create_vpp_vxlan_encap(req, tunnel_data, true) != SAI_STATUS_SUCCESS) {
+                SWSS_LOG_ERROR("Failed to create the decap-only tunnel of VNI %u to %s",
+                    vni, sai_serialize_ip_address(tunnel_data.dst_ip).c_str());
+                continue;
+            }
+            if (create_vpp_vxlan_decap(tunnel_data) != SAI_STATUS_SUCCESS) {
+                SWSS_LOG_ERROR("Failed to create the decap of VNI %u from %s",
+                    vni, sai_serialize_ip_address(tunnel_data.dst_ip).c_str());
+                remove_vpp_vxlan_encap(req, tunnel_data, true);
+                continue;
+            }
+            m_l3_decap_tunnels[l3_tunnel_key(tunnel_data.dst_ip, vni)] = tunnel_data;
+            SWSS_LOG_NOTICE("Created the decap-only tunnel of VNI %u from %s",
+                vni, sai_serialize_ip_address(tunnel_data.dst_ip).c_str());
+        }
+    }
+}
+
+void
+TunnelManager::remove_l3_decap_tunnels(
+                    _In_ const sai_ip_address_t* dst_ip,
+                    _In_ u_int32_t vni)
+{
+    SWSS_LOG_ENTER();
+
+    for (auto it = m_l3_decap_tunnels.begin(); it != m_l3_decap_tunnels.end();) {
+        auto& tunnel_data = it->second;
+
+        if ((dst_ip && !sai_ip_address_equal(tunnel_data.dst_ip, *dst_ip)) ||
+            (vni != 0 && tunnel_data.vni != vni)) {
+            ++it;
+            continue;
+        }
+
+        vpp_vxlan_tunnel_t req;
+
+        fill_l3_vxlan_req(req, tunnel_data.src_ip, tunnel_data.dst_ip, tunnel_data.vni);
+        remove_vpp_vxlan_decap(tunnel_data);
+        remove_vpp_vxlan_encap(req, tunnel_data, true);
+        it = m_l3_decap_tunnels.erase(it);
+    }
+}
+
+void
+TunnelManager::handle_l3_vni_map_entry_removal(
+    _In_ const std::string& serializedObjectId)
+{
+    SWSS_LOG_ENTER();
+
+    auto entry_obj = m_switch_db->get_sai_object(
+        SAI_OBJECT_TYPE_TUNNEL_MAP_ENTRY, serializedObjectId);
+    if (!entry_obj) {
+        return;
+    }
+
+    sai_attribute_t attr;
+
+    attr.id = SAI_TUNNEL_MAP_ENTRY_ATTR_TUNNEL_MAP_TYPE;
+    if (entry_obj->get_attr(attr) != SAI_STATUS_SUCCESS ||
+        attr.value.s32 != SAI_TUNNEL_MAP_TYPE_VIRTUAL_ROUTER_ID_TO_VNI) {
+        return;
+    }
+
+    attr.id = SAI_TUNNEL_MAP_ENTRY_ATTR_VNI_ID_VALUE;
+    if (entry_obj->get_attr(attr) != SAI_STATUS_SUCCESS || attr.value.u32 == 0) {
+        return;
+    }
+    remove_l3_decap_tunnels(nullptr, attr.value.u32);
+}
+
 sai_status_t
 TunnelManager::create_vpp_vxlan_encap(
                     _In_  vpp_vxlan_tunnel_t& req,
@@ -339,9 +565,6 @@ TunnelManager::create_vpp_vxlan_encap(
     u_int32_t                   sw_if_index;
     char                        src_ip_str[INET6_ADDRSTRLEN];
     char                        dst_ip_str[INET6_ADDRSTRLEN];
-    auto                        router_mac = tunnel_data.has_remote_router_mac ?
-                                    tunnel_data.remote_router_mac : get_router_mac();
-    auto                        bvi_mac = router_mac.data();
 
     vpp_status = vpp_vxlan_tunnel_add_del(&req, 1, &sw_if_index);
     vpp_ip_addr_t_to_string(&req.src_address, src_ip_str, INET6_ADDRSTRLEN);
@@ -356,12 +579,7 @@ TunnelManager::create_vpp_vxlan_encap(
     tunnel_data.sw_if_index = sw_if_index;
 
     if (!skip_neighbor) {
-        /* the neighbour is to build inner ether. use no_fib_entry to avoid creating the nh in the fib, which will mess up underlay forwarding*/
-        if (req.dst_address.sa_family == AF_INET6) {
-            ip6_nbr_add_del(NULL, sw_if_index, &req.dst_address.addr.ip6, false, true/*no_fib_entry*/, bvi_mac, 1);
-        } else {
-            ip4_nbr_add_del(NULL, sw_if_index, &req.dst_address.addr.ip4, false, true/*no_fib_entry*/, bvi_mac, 1);
-        }
+        set_l3_tunnel_neighbor(req, tunnel_data, true);
     }
 
     SWSS_LOG_INFO("successfully created encap for vxlan tunnel %d", sw_if_index);
@@ -380,16 +598,9 @@ TunnelManager::remove_vpp_vxlan_encap(
     u_int32_t                   sw_if_index = tunnel_data.sw_if_index;
     char                        src_ip_str[INET6_ADDRSTRLEN];
     char                        dst_ip_str[INET6_ADDRSTRLEN];
-    auto                        router_mac = tunnel_data.has_remote_router_mac ?
-                                    tunnel_data.remote_router_mac : get_router_mac();
-    auto                        bvi_mac = router_mac.data();
 
     if (!skip_neighbor) {
-        if (req.dst_address.sa_family == AF_INET6) {
-            ip6_nbr_add_del(NULL, tunnel_data.sw_if_index, &req.dst_address.addr.ip6, false, true/*no_fib_entry*/, bvi_mac, 0);
-        } else {
-            ip4_nbr_add_del(NULL, tunnel_data.sw_if_index, &req.dst_address.addr.ip4, false, true/*no_fib_entry*/, bvi_mac, 0);
-        }
+        set_l3_tunnel_neighbor(req, tunnel_data, false);
     }
 
     vpp_status = vpp_vxlan_tunnel_add_del(&req, 0, &sw_if_index);
