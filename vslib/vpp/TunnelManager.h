@@ -44,6 +44,11 @@ namespace saivs
         // kernel; empty when the BVI has none.
         std::string decap_host_if;
 
+        // A decap-only tunnel's BVI gets no host path: every host tap pins
+        // VPP buffers for its rx ring, and a switch with dozens of VRF x VTEP
+        // pairs runs the buffer pool dry.
+        bool decap_only = false;
+
         // L2 VXLAN fields
         u_int32_t vni = 0;
         u_int16_t vlan_id = 0;

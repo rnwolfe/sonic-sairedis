@@ -845,13 +845,10 @@ TEST_F(SwitchVppTunnelNexthop, DoesNotBorrowTheKernelVrfOfAnotherVirtualRouter)
     // VNI 2000 belongs to VR B
     ASSERT_EQ(SAI_STATUS_SUCCESS, createNexthop(2000, nh, REMOTE_ROUTER_MAC));
 
-    auto own = decapBvi(0);
-    auto vniA = decapBvi(1);
-
-    // only the decap-only BVI of VR A's own VNI goes into VR A's kernel VRF
-    EXPECT_EQ(-1, vppCallIndex("configure_lcp_interface", own + " tap_" + own));
-    ASSERT_EQ(1u, m_redirects.size());
-    EXPECT_EQ("tap_" + vniA + " VrfA", m_redirects[0]);
+    // neither the next hop's BVI nor VR A's decap-only one (decap-only BVIs
+    // get no host path) goes into VR A's kernel VRF
+    EXPECT_TRUE(vppCallsTo("configure_lcp_interface").empty());
+    EXPECT_TRUE(m_redirects.empty());
 }
 
 TEST_F(SwitchVppTunnelNexthop, GivesItsVtepADecapTunnelForEveryOtherL3Vni)
@@ -877,6 +874,28 @@ TEST_F(SwitchVppTunnelNexthop, GivesItsVtepADecapTunnelForEveryOtherL3Vni)
     EXPECT_EQ(1u, vppCallsTo("ip4_nbr_add_del").size());
 }
 
+TEST_F(SwitchVppTunnelNexthop, DecapOnlyTunnelsGetNoHostPath)
+{
+    ASSERT_EQ(SAI_STATUS_SUCCESS, createVlanRif(m_vrA, 100));
+    ASSERT_EQ(SAI_STATUS_SUCCESS, createVlanRif(m_vrB, 3000));
+
+    m_kernelMasters["Vlan100"] = "VrfA";
+    m_kernelMasters["Vlan3000"] = "Vrft";
+
+    g_vppCalls.clear();
+
+    sai_object_id_t nh;
+
+    ASSERT_EQ(SAI_STATUS_SUCCESS, createNexthop(2000, nh, REMOTE_ROUTER_MAC));
+
+    // only the next hop's BVI pairs a host tap: each tap pins VPP buffers
+    auto own = decapBvi(0);
+
+    ASSERT_EQ(1u, vppCallsTo("configure_lcp_interface").size());
+    ASSERT_EQ(1u, m_redirects.size());
+    EXPECT_EQ("tap_" + own + " Vrft", m_redirects[0]);
+}
+
 TEST_F(SwitchVppTunnelNexthop, ALaterNexthopTakesOverTheDecapTunnelOfItsVni)
 {
     sai_object_id_t nhB;
@@ -891,9 +910,11 @@ TEST_F(SwitchVppTunnelNexthop, ALaterNexthopTakesOverTheDecapTunnelOfItsVni)
 
     ASSERT_EQ(SAI_STATUS_SUCCESS, createNexthop(1000, nhA, REMOTE_ROUTER_MAC));
 
-    // no new tunnel or BVI, just the neighbour encap needs
+    // no new tunnel, but the decap side is rebuilt so the next hop's BVI gets
+    // the host path the decap-only one went without, plus the encap neighbour
     EXPECT_TRUE(vppCallsTo("vpp_vxlan_tunnel_add_del").empty());
-    EXPECT_TRUE(vppCallsTo("create_bvi_interface").empty());
+    EXPECT_EQ(1u, vppCallsTo("delete_bvi_interface").size());
+    EXPECT_EQ(1u, vppCallsTo("create_bvi_interface").size());
 
     auto nbrs = vppCallsTo("ip4_nbr_add_del");
 

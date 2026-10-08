@@ -182,7 +182,12 @@ TunnelManager::tunnel_encap_nexthop_action(
         // While other next hops use the VTEP it can keep sending this VNI:
         // the tunnel stays, decap only.
         if (has_l3_nexthop_to(dst_ip)) {
+            char hw_bvi_ifname[32];
+
+            snprintf(hw_bvi_ifname, sizeof(hw_bvi_ifname), "bvi%u", tunnel_data.bd_id);
             set_l3_tunnel_neighbor(req, tunnel_data, false);
+            remove_decap_host_path(tunnel_data, hw_bvi_ifname);
+            tunnel_data.decap_only = true;
             m_l3_decap_tunnels[l3_tunnel_key(dst_ip, tunnel_data.vni)] = tunnel_data;
             return SAI_STATUS_SUCCESS;
         }
@@ -280,12 +285,18 @@ TunnelManager::tunnel_encap_nexthop_action(
 
             auto decap_it = m_l3_decap_tunnels.find(l3_tunnel_key(dst_ip, tunnel_vni));
             if (decap_it != m_l3_decap_tunnels.end()) {
-                // The VTEP's decap-only tunnel of this VNI becomes the next hop's
+                // The VTEP's decap-only tunnel of this VNI becomes the next
+                // hop's. Its BVI has no host path, so rebuild the decap side.
                 tunnel_data.sw_if_index = decap_it->second.sw_if_index;
-                tunnel_data.bd_id = decap_it->second.bd_id;
-                tunnel_data.decap_host_if = decap_it->second.decap_host_if;
+                remove_vpp_vxlan_decap(decap_it->second);
                 m_l3_decap_tunnels.erase(decap_it);
                 set_l3_tunnel_neighbor(req, tunnel_data, true);
+                if (create_vpp_vxlan_decap(tunnel_data) != SAI_STATUS_SUCCESS) {
+                    SWSS_LOG_ERROR("Failed to create vxlan decap for %s",
+                        tunnel_nh_obj->get_id().c_str());
+                    remove_vpp_vxlan_encap(req, tunnel_data);
+                    return SAI_STATUS_FAILURE;
+                }
             } else {
                 if (create_vpp_vxlan_encap(req, tunnel_data) != SAI_STATUS_SUCCESS) {
                     SWSS_LOG_ERROR("Failed to create vxlan encap for %s",
@@ -481,6 +492,7 @@ TunnelManager::create_l3_decap_tunnels(
             tunnel_data.remote_router_mac = nh_tunnel_data.remote_router_mac;
             tunnel_data.src_ip = nh_tunnel_data.src_ip;
             tunnel_data.dst_ip = nh_tunnel_data.dst_ip;
+            tunnel_data.decap_only = true;
             fill_l3_vxlan_req(req, tunnel_data.src_ip, tunnel_data.dst_ip, vni);
 
             if (create_vpp_vxlan_encap(req, tunnel_data, true) != SAI_STATUS_SUCCESS) {
@@ -656,7 +668,9 @@ TunnelManager::create_vpp_vxlan_decap(
     // Before the BVI joins its bridge domain, see create_decap_host_path.
     // Without a host path the switch's own addresses in the VRF are unreachable
     // over the tunnel, but transit still works, so a failure is not fatal.
-    create_decap_host_path(tunnel_data, hw_bvi_ifname);
+    if (!tunnel_data.decap_only) {
+        create_decap_host_path(tunnel_data, hw_bvi_ifname);
+    }
 
     //Create bridge and set BVI to the BD
     vpp_status = set_sw_interface_l2_bridge(hw_bvi_ifname, bd_id, true, VPP_API_PORT_TYPE_BVI);
