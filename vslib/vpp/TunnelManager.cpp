@@ -539,6 +539,81 @@ TunnelManager::remove_l3_decap_tunnels(
 }
 
 void
+TunnelManager::handle_l3_vni_map_entry(
+    _In_ const std::string& serializedObjectId,
+    _In_ uint32_t attr_count,
+    _In_ const sai_attribute_t *attr_list)
+{
+    SWSS_LOG_ENTER();
+
+    SaiCachedObject entry_obj(m_switch_db, SAI_OBJECT_TYPE_TUNNEL_MAP_ENTRY,
+                              serializedObjectId, attr_count, attr_list);
+    sai_attribute_t attr;
+
+    attr.id = SAI_TUNNEL_MAP_ENTRY_ATTR_TUNNEL_MAP_TYPE;
+    if (entry_obj.get_attr(attr) != SAI_STATUS_SUCCESS ||
+        attr.value.s32 != SAI_TUNNEL_MAP_TYPE_VIRTUAL_ROUTER_ID_TO_VNI) {
+        return;
+    }
+
+    attr.id = SAI_TUNNEL_MAP_ENTRY_ATTR_VNI_ID_VALUE;
+    if (entry_obj.get_attr(attr) != SAI_STATUS_SUCCESS || attr.value.u32 == 0) {
+        return;
+    }
+    u_int32_t vni = attr.value.u32;
+
+    attr.id = SAI_TUNNEL_MAP_ENTRY_ATTR_VIRTUAL_ROUTER_ID_KEY;
+    if (entry_obj.get_attr(attr) != SAI_STATUS_SUCCESS) {
+        return;
+    }
+    auto ip_vrf = m_switch_db->vpp_get_ip_vrf(attr.value.oid);
+    if (!ip_vrf) {
+        SWSS_LOG_NOTICE("VNI %u: VR %s has no VPP table yet, no decap-only tunnels",
+            vni, sai_serialize_object_id(attr.value.oid).c_str());
+        return;
+    }
+
+    // One decap-only tunnel per remote VTEP that already has an L3 next hop
+    std::map<std::string, TunnelVPPData> vteps;
+
+    for (const auto& it : m_tunnel_encap_nexthop_map) {
+        vteps.emplace(sai_serialize_ip_address(it.second.dst_ip), it.second);
+    }
+
+    for (const auto& it : vteps) {
+        const auto& nh_tunnel_data = it.second;
+
+        if (has_l3_tunnel(nh_tunnel_data.dst_ip, vni)) {
+            continue;
+        }
+
+        TunnelVPPData tunnel_data;
+        vpp_vxlan_tunnel_t req;
+
+        tunnel_data.ip_vrf = ip_vrf;
+        tunnel_data.vni = vni;
+        tunnel_data.has_remote_router_mac = nh_tunnel_data.has_remote_router_mac;
+        tunnel_data.remote_router_mac = nh_tunnel_data.remote_router_mac;
+        tunnel_data.src_ip = nh_tunnel_data.src_ip;
+        tunnel_data.dst_ip = nh_tunnel_data.dst_ip;
+        tunnel_data.decap_only = true;
+        fill_l3_vxlan_req(req, tunnel_data.src_ip, tunnel_data.dst_ip, vni);
+
+        if (create_vpp_vxlan_encap(req, tunnel_data, true) != SAI_STATUS_SUCCESS) {
+            SWSS_LOG_ERROR("Failed to create the decap-only tunnel of VNI %u to %s", vni, it.first.c_str());
+            continue;
+        }
+        if (create_vpp_vxlan_decap(tunnel_data) != SAI_STATUS_SUCCESS) {
+            SWSS_LOG_ERROR("Failed to create the decap of VNI %u from %s", vni, it.first.c_str());
+            remove_vpp_vxlan_encap(req, tunnel_data, true);
+            continue;
+        }
+        m_l3_decap_tunnels[l3_tunnel_key(tunnel_data.dst_ip, vni)] = tunnel_data;
+        SWSS_LOG_NOTICE("Created the decap-only tunnel of VNI %u from %s", vni, it.first.c_str());
+    }
+}
+
+void
 TunnelManager::handle_l3_vni_map_entry_removal(
     _In_ const std::string& serializedObjectId)
 {

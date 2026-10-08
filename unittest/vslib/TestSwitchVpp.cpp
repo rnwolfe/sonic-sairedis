@@ -530,6 +530,7 @@ class SwitchVppTunnelNexthop : public SwitchVppVrf
             m_vrUnknown = createVrWithoutTable();
 
             auto map = m_mgr->allocateNewObjectId(SAI_OBJECT_TYPE_TUNNEL_MAP, m_switchId);
+            m_map = map;
 
             sai_attribute_t mattr;
 
@@ -643,8 +644,9 @@ class SwitchVppTunnelNexthop : public SwitchVppVrf
             eattrs[3].id = SAI_TUNNEL_MAP_ENTRY_ATTR_VNI_ID_VALUE;
             eattrs[3].value.u32 = vni;
 
+            // through create(), so the switch sees it the way syncd hands it over
             EXPECT_EQ(SAI_STATUS_SUCCESS,
-                    m_sw->create_internal(SAI_OBJECT_TYPE_TUNNEL_MAP_ENTRY, sai_serialize_object_id(entry), m_switchId, 4, eattrs));
+                    m_sw->create(SAI_OBJECT_TYPE_TUNNEL_MAP_ENTRY, sai_serialize_object_id(entry), m_switchId, 4, eattrs));
 
             return entry;
         }
@@ -685,6 +687,7 @@ class SwitchVppTunnelNexthop : public SwitchVppVrf
         sai_object_id_t m_vrUnknown = SAI_NULL_OBJECT_ID;
         sai_object_id_t m_tunnel = SAI_NULL_OBJECT_ID;
         sai_object_id_t m_entryA = SAI_NULL_OBJECT_ID;
+        sai_object_id_t m_map = SAI_NULL_OBJECT_ID;
 
         std::map<std::string, std::string> m_kernelMasters;
 
@@ -999,6 +1002,31 @@ TEST_F(SwitchVppTunnelNexthop, KeepsATunnelForDecapWhileItsVtepHasOtherNexthops)
     EXPECT_EQ(2000u, tunnels[1].id);
     EXPECT_FALSE(tunnels[1].flag);
     EXPECT_EQ(2u, vppCallsTo("delete_bvi_interface").size());
+}
+
+TEST_F(SwitchVppTunnelNexthop, AVrfAddedLaterGetsADecapTunnelToEveryKnownVtep)
+{
+    sai_object_id_t nh;
+
+    ASSERT_EQ(SAI_STATUS_SUCCESS, createNexthop(2000, nh, REMOTE_ROUTER_MAC));
+
+    auto vrC = createVr();
+
+    g_vppCalls.clear();
+
+    // a VRF and its L3VNI configured after the fabric converged
+    addMapEntry(m_map, vrC, 4000);
+
+    auto tunnels = vppCallsTo("vpp_vxlan_tunnel_add_del");
+
+    ASSERT_EQ(1u, tunnels.size());
+    EXPECT_EQ(4000u, tunnels[0].id);
+    EXPECT_TRUE(tunnels[0].flag);
+
+    auto binds = vppCallsTo("set_interface_vrf");
+
+    ASSERT_EQ(2u, binds.size());
+    EXPECT_EQ(tableOf(vrC), binds[0].id);
 }
 
 TEST_F(SwitchVppTunnelNexthop, RemovingAVniMapEntryRemovesTheDecapTunnelsOfItsVni)

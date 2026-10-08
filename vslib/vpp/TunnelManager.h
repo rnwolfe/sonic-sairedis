@@ -203,6 +203,16 @@ namespace saivs
         void handle_l3_vni_map_entry_removal(
             _In_ const std::string& serializedObjectId);
 
+        /**
+         * @brief After a VR->VNI map entry is created, give every remote VTEP
+         * that already has an L3 next hop a decap-only tunnel for the new VNI.
+         * A VRF added after the fabric converged would otherwise never decap.
+         */
+        void handle_l3_vni_map_entry(
+            _In_ const std::string& serializedObjectId,
+            _In_ uint32_t attr_count,
+            _In_ const sai_attribute_t *attr_list);
+
     private:
         SwitchVpp* m_switch_db;
         std::array<uint8_t, 6> m_router_mac;
