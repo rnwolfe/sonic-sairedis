@@ -639,7 +639,12 @@ namespace saivs
                     _In_ uint32_t attr_count,
                     _In_ const sai_attribute_t *attr_list);
 
-            sai_status_t vpp_update_router_interface(
+            sai_status_t vpp_update_vlan_router_interface(
+                _In_ sai_object_id_t object_id,
+                _In_ uint32_t attr_count,
+                _In_ const sai_attribute_t *attr_list);
+
+        sai_status_t vpp_update_router_interface(
                     _In_ sai_object_id_t object_id,
                     _In_ uint32_t attr_count,
                     _In_ const sai_attribute_t *attr_list);

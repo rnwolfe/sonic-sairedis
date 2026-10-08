@@ -2004,6 +2004,62 @@ sai_status_t SwitchVpp::vpp_create_router_interface(
     }
 }
 
+sai_status_t SwitchVpp::vpp_update_vlan_router_interface(
+        _In_ sai_object_id_t object_id,
+        _In_ uint32_t attr_count,
+        _In_ const sai_attribute_t *attr_list)
+{
+    SWSS_LOG_ENTER();
+
+    // A VLAN router interface is its VLAN's BVI. orchagent sets its source MAC
+    // after the create (the static anycast gateway MAC, for one), and the BVI
+    // has to answer to it, or VPP drops every frame sent to the gateway as
+    // "BVI L3 mac mismatch".
+    auto attr_mac = sai_metadata_get_attr_by_id(SAI_ROUTER_INTERFACE_ATTR_SRC_MAC_ADDRESS, attr_count, attr_list);
+
+    if (attr_mac == NULL)
+    {
+        return SAI_STATUS_SUCCESS;
+    }
+
+    sai_attribute_t attr;
+
+    attr.id = SAI_ROUTER_INTERFACE_ATTR_VLAN_ID;
+    sai_status_t status = get(SAI_OBJECT_TYPE_ROUTER_INTERFACE, object_id, 1, &attr);
+
+    if (status != SAI_STATUS_SUCCESS || objectTypeQuery(attr.value.oid) != SAI_OBJECT_TYPE_VLAN)
+    {
+        SWSS_LOG_ERROR("VLAN router interface %s has no VLAN", sai_serialize_object_id(object_id).c_str());
+        return SAI_STATUS_FAILURE;
+    }
+
+    sai_attribute_t vattr;
+
+    vattr.id = SAI_VLAN_ATTR_VLAN_ID;
+    status = get(SAI_OBJECT_TYPE_VLAN, attr.value.oid, 1, &vattr);
+
+    if (status != SAI_STATUS_SUCCESS)
+    {
+        SWSS_LOG_ERROR("Failed to read the VLAN id of %s", sai_serialize_object_id(attr.value.oid).c_str());
+        return SAI_STATUS_FAILURE;
+    }
+
+    char hw_bvi_ifname[32];
+    sai_mac_t mac;
+
+    snprintf(hw_bvi_ifname, sizeof(hw_bvi_ifname), "bvi%u", vattr.value.u16);
+    memcpy(mac, attr_mac->value.mac, sizeof(mac));
+
+    if (sw_interface_set_mac(hw_bvi_ifname, mac) != 0)
+    {
+        SWSS_LOG_ERROR("Failed to set the MAC of %s", hw_bvi_ifname);
+        return SAI_STATUS_FAILURE;
+    }
+    SWSS_LOG_NOTICE("Set the MAC of %s to %s", hw_bvi_ifname, sai_serialize_mac(attr_mac->value.mac).c_str());
+
+    return set_internal(SAI_OBJECT_TYPE_ROUTER_INTERFACE, sai_serialize_object_id(object_id), attr_mac);
+}
+
 sai_status_t SwitchVpp::vpp_update_router_interface(
         _In_ sai_object_id_t object_id,
         _In_ uint32_t attr_count,
@@ -2024,6 +2080,11 @@ sai_status_t SwitchVpp::vpp_update_router_interface(
         return SAI_STATUS_FAILURE;
     }
     rif_type = attr.value.s32;
+
+    if (rif_type == SAI_ROUTER_INTERFACE_TYPE_VLAN)
+    {
+        return vpp_update_vlan_router_interface(object_id, attr_count, attr_list);
+    }
 
     attr.id = SAI_ROUTER_INTERFACE_ATTR_PORT_ID;
     status = get(SAI_OBJECT_TYPE_ROUTER_INTERFACE, object_id, 1, &attr);
