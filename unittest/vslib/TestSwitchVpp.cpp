@@ -51,6 +51,17 @@ namespace
 
     uint32_t g_nextSwIfIndex = 100;
 
+    /*
+     * VPP sends L2_MACS_EVENT on the command socket. These are the events it
+     * has sent that nothing has read yet; vpp_l2_macs_events_poll() hands them
+     * to the callback the switch registered with vpp_want_l2_macs_events2().
+     * No other stub reads them, so the tests see a SONiC that makes no
+     * unrelated VPP call.
+     */
+    std::vector<vpp_mac_event_t> g_unreadMacEvents;
+    vpp_mac_event_cb_fn g_macEventCb = nullptr;
+    void *g_macEventCtx = nullptr;
+
     std::string macStr(
             const uint8_t *mac)
     {
@@ -106,7 +117,39 @@ extern "C" {
 int __wrap_init_vpp_client() { return 0; }
 int __wrap_vpp_sync_for_events() { return 0; }
 vpp_event_info_t * __wrap_vpp_ev_dequeue() { return NULL; }
-int __wrap_vpp_want_l2_macs_events2(bool enable, vpp_mac_event_cb_fn cb, void *ctx) { return 0; }
+int __wrap_vpp_want_l2_macs_events2(bool enable, vpp_mac_event_cb_fn cb, void *ctx)
+{
+    SWSS_LOG_ENTER();
+
+    g_macEventCb = enable ? cb : nullptr;
+    g_macEventCtx = enable ? ctx : nullptr;
+    return 0;
+}
+
+int __wrap_vpp_l2fib_set_scan_delay(uint16_t delay_10ms) { return 0; }
+
+int __wrap_vpp_l2_macs_events_poll()
+{
+    SWSS_LOG_ENTER();
+
+    g_vppCalls.push_back({"vpp_l2_macs_events_poll", "", 0, 0, false});
+
+    if (g_unreadMacEvents.empty())
+    {
+        return 0;
+    }
+
+    std::vector<vpp_mac_event_t> evs;
+
+    evs.swap(g_unreadMacEvents);
+
+    if (g_macEventCb)
+    {
+        g_macEventCb(evs.data(), (uint32_t)evs.size(), g_macEventCtx);
+    }
+
+    return 1;
+}
 int __wrap_refresh_interfaces_list() { return 0; }
 int __wrap_set_sw_interface_l2_bridge(const char *hwif_name, uint32_t bridge_id, bool l2_enable, uint32_t port_type)
 {
@@ -1657,6 +1700,90 @@ TEST_F(SwitchVppLagFdb, LearnedEntryRemovedOnTheLagBridgePortIsLearnedAgain)
     vppMacEvent(VPP_MAC_ACTION_ADD);
 
     EXPECT_NE(nullptr, fdbBridgePort());
+}
+
+/*
+ * VPP sends its MAC events on the command socket, which saivpp otherwise reads
+ * only while a call waits for its reply. A MAC VPP learns while SONiC makes no
+ * other VPP call, like a host that sends a frame now and then, or comes back
+ * after its PortChannel flapped, must still be reported: the FDB aging pass
+ * reads the pending events itself instead of waiting for an unrelated call.
+ */
+class SwitchVppIdleMacEvents : public SwitchVppLagFdb
+{
+    protected:
+
+        void SetUp() override
+        {
+            SwitchVppLagFdb::SetUp();
+
+            g_unreadMacEvents.clear();
+
+            // what Sai::startFdbAgingThread() does
+            m_sw->initFdbEventHandling([]() {});
+
+            ASSERT_NE(nullptr, g_macEventCb);
+        }
+
+        void TearDown() override
+        {
+            g_unreadMacEvents.clear();
+
+            SwitchVppLagFdb::TearDown();
+        }
+
+        // VPP learns MAC on the bond and sends the event; nothing reads it yet
+        void vppSendsMacEvent(
+                uint8_t action)
+        {
+            SWSS_LOG_ENTER();
+
+            vpp_mac_event_t ev;
+
+            memcpy(ev.mac, MAC, sizeof(ev.mac));
+            ev.sw_if_index = BOND_SW_IF_INDEX;
+            ev.action = action;
+
+            g_unreadMacEvents.push_back(ev);
+        }
+};
+
+TEST_F(SwitchVppIdleMacEvents, MacLearnedWhileSonicIsIdleIsReportedByTheAgingPass)
+{
+    vppSendsMacEvent(VPP_MAC_ACTION_ADD);
+
+    // the FDB aging thread's 1 s tick; no other VPP call happens
+    m_sw->processFdbEntriesForAging();
+
+    auto bp = fdbBridgePort();
+
+    ASSERT_NE(nullptr, bp);
+    EXPECT_EQ(m_bridgePort, bp->getAttr()->value.oid);
+    EXPECT_TRUE(g_unreadMacEvents.empty());
+}
+
+/*
+ * The dev-lab case: PortChannel24 flaps, orchagent flushes its bridge port and
+ * saivpp deletes the MACs from the L2FIB. A quiet host's next frame, after
+ * orchagent has finished with the flap, makes VPP learn the MAC again.
+ */
+TEST_F(SwitchVppIdleMacEvents, MacRelearnedAfterAFlushWhileSonicIsIdleIsReported)
+{
+    vppSendsMacEvent(VPP_MAC_ACTION_ADD);
+    m_sw->processFdbEntriesForAging();
+
+    ASSERT_NE(nullptr, fdbBridgePort());
+
+    ASSERT_EQ(SAI_STATUS_SUCCESS, flushBridgePort());
+    ASSERT_EQ(nullptr, fdbBridgePort());
+
+    vppSendsMacEvent(VPP_MAC_ACTION_ADD);
+    m_sw->processFdbEntriesForAging();
+
+    auto bp = fdbBridgePort();
+
+    ASSERT_NE(nullptr, bp);
+    EXPECT_EQ(m_bridgePort, bp->getAttr()->value.oid);
 }
 
 /*
