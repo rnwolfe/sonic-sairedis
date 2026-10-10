@@ -1537,6 +1537,11 @@ namespace saivs
                     _In_ sai_object_id_t bv_id,
                     _Out_ uint16_t& vlan_id);
 
+            // Whether mac is the MAC of the VLAN's router interface (its BVI's).
+            bool is_vlan_router_mac(
+                    _In_ sai_object_id_t vlan_oid,
+                    _In_ const sai_mac_t mac);
+
             // An attribute as SAI holds it, or null; logs nothing if absent.
             const sai_attribute_t* stored_attr(
                     _In_ sai_object_type_t object_type,

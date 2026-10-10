@@ -3456,6 +3456,40 @@ bool SwitchVpp::vlan_id_of_bv(
     return true;
 }
 
+bool SwitchVpp::is_vlan_router_mac(
+        _In_ sai_object_id_t vlan_oid,
+        _In_ const sai_mac_t mac)
+{
+    SWSS_LOG_ENTER();
+
+    for (auto& kv: m_objectHash.at(SAI_OBJECT_TYPE_ROUTER_INTERFACE))
+    {
+        auto type = stored_attr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, kv.first, SAI_ROUTER_INTERFACE_ATTR_TYPE);
+        auto vlan = stored_attr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, kv.first, SAI_ROUTER_INTERFACE_ATTR_VLAN_ID);
+
+        if (type == nullptr || type->value.s32 != SAI_ROUTER_INTERFACE_TYPE_VLAN ||
+                vlan == nullptr || vlan->value.oid != vlan_oid)
+        {
+            continue;
+        }
+
+        // the BVI's MAC: the router interface's, else the switch's (see vpp_create_bvi_interface())
+        auto src_mac = stored_attr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, kv.first, SAI_ROUTER_INTERFACE_ATTR_SRC_MAC_ADDRESS);
+
+        if (src_mac == nullptr)
+        {
+            src_mac = stored_attr(SAI_OBJECT_TYPE_SWITCH, sai_serialize_object_id(m_switch_id), SAI_SWITCH_ATTR_SRC_MAC_ADDRESS);
+        }
+
+        if (src_mac && memcmp(src_mac->value.mac, mac, sizeof(sai_mac_t)) == 0)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static bool is_zero_ip(
         _In_ const sai_ip_address_t& ip)
 {
@@ -3528,6 +3562,18 @@ bool SwitchVpp::remote_fdb_target(
     if (!vlan_id_of_bv(fdb_entry.bv_id, vlan_id))
     {
         SWSS_LOG_NOTICE("FDB entry %s: bv_id is not a VLAN, not programmed", serializedObjectId.c_str());
+        return false;
+    }
+
+    /*
+     * Every VTEP with a gateway on the VLAN advertises the gateway MAC (an
+     * anycast one is the same everywhere). VPP terminates frames to it with
+     * the BVI's own L2FIB entry, which an entry on a tunnel would replace.
+     */
+    if (is_vlan_router_mac(fdb_entry.bv_id, fdb_entry.mac_address))
+    {
+        SWSS_LOG_NOTICE("FDB entry %s: the MAC of the VLAN's router interface stays on its BVI, not programmed",
+                serializedObjectId.c_str());
         return false;
     }
 

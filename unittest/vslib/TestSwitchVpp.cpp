@@ -2374,6 +2374,43 @@ TEST_F(SwitchVppEvpnRemoteMac, EndpointIpPicksTheTunnel)
 }
 
 /*
+ * Every VTEP with a gateway on the VLAN advertises the gateway MAC, an anycast
+ * one included. It stays on the local BVI: VPP routes a frame to it only
+ * through the BVI's L2FIB entry, which an entry on a tunnel would replace.
+ */
+TEST_F(SwitchVppEvpnRemoteMac, GatewayMacOfTheVlanIsNotPointedAtATunnel)
+{
+    addMapEntry();
+
+    sai_object_id_t bpA;
+
+    addRemoteVtep(VTEP_A, &bpA);
+
+    auto rif = m_mgr->allocateNewObjectId(SAI_OBJECT_TYPE_ROUTER_INTERFACE, m_switchId);
+
+    sai_attribute_t rattrs[4];
+
+    rattrs[0].id = SAI_ROUTER_INTERFACE_ATTR_TYPE;
+    rattrs[0].value.s32 = SAI_ROUTER_INTERFACE_TYPE_VLAN;
+    rattrs[1].id = SAI_ROUTER_INTERFACE_ATTR_VIRTUAL_ROUTER_ID;
+    rattrs[1].value.oid = m_mgr->allocateNewObjectId(SAI_OBJECT_TYPE_VIRTUAL_ROUTER, m_switchId);
+    rattrs[2].id = SAI_ROUTER_INTERFACE_ATTR_VLAN_ID;
+    rattrs[2].value.oid = m_vlan;
+    rattrs[3].id = SAI_ROUTER_INTERFACE_ATTR_SRC_MAC_ADDRESS;
+    memcpy(rattrs[3].value.mac, REMOTE_MAC, sizeof(sai_mac_t));
+
+    // the SAI object is enough; creating it through create() would build the BVI
+    ASSERT_EQ(SAI_STATUS_SUCCESS,
+            m_sw->create_internal(SAI_OBJECT_TYPE_ROUTER_INTERFACE, sai_serialize_object_id(rif), m_switchId, 4, rattrs));
+
+    g_vppCalls.clear();
+
+    ASSERT_EQ(SAI_STATUS_SUCCESS, addRemoteMac(bpA, VTEP_A));
+
+    EXPECT_TRUE(vppCallsTo("l2fib_add_del_by_index").empty());
+}
+
+/*
  * orchagent moves a remote MAC address to another VTEP by setting the bridge
  * port, then the endpoint, one at a time. VPP has to end up with it on the
  * new VTEP's tunnel, and replacing the entry in place leaves no gap in which
