@@ -81,7 +81,11 @@ tests_LDFLAGS = \
 				-Wl,--wrap=ip4_nbr_add_del \
 				-Wl,--wrap=ip6_nbr_add_del \
 				-Wl,--wrap=vpp_bridge_domain_add_del \
-				-Wl,--wrap=ip_route_add_del_get_stats
+				-Wl,--wrap=ip_route_add_del_get_stats \
+				-Wl,--wrap=l2fib_add_del \
+				-Wl,--wrap=l2fib_flush_all \
+				-Wl,--wrap=l2fib_flush_int \
+				-Wl,--wrap=l2fib_flush_bd
 endif
 
 tests_CXXFLAGS = $(DBGFLAGS) $(AM_CXXFLAGS) $(CXXFLAGS_COMMON) -fno-access-control
